@@ -90,6 +90,24 @@ unioned_totals as (
     select * from bootstrap_totals
 ),
 
+-- SKU context: how new is it, and how much of its history was out of stock.
+-- Both help a buyer judge how much to trust the base-demand number.
+sku_context as (
+
+    select
+        w.sku,
+        min(d.first_sale_date) as first_sale_date,
+        sum(w.low_stock_days) as n_oos_days_total
+    from {{ ref('fct_weekly_sku_sales') }} w
+    join (
+        select sku, min(sales_date) as first_sale_date
+        from {{ ref('fct_daily_sku_sales') }}
+        group by 1
+    ) d using (sku)
+    group by 1
+
+),
+
 -- MODEL DIVERGENCE: how much the candidate models DISAGREE on the order-window
 -- total for this SKU. Works at holdout=0 (no actuals needed) — it compares the
 -- models to each other, not to truth. Tight agreement = the winner's number is
@@ -136,6 +154,15 @@ select
     d._extracted_unit_conversion,
     round((t.forecast_total_qty * d._extracted_unit_conversion), 1) as forecast_total_unit,
 
+    -- SKU age: how long the SKU had been selling by the start of the forecast
+    -- window (falls back to today for bootstrap SKUs, which have no window)
+    x.first_sale_date,
+    round(date_diff(coalesce(t.window_start_week, current_date()), x.first_sale_date, day) / 7.0, 1)
+        as sku_age_weeks,
+    -- total OOS days across history: a high count means much of this SKU's demand
+    -- signal was censored, so the base-demand number rests on imputed weeks
+    x.n_oos_days_total,
+
     -- model-agreement diagnostic (null for bootstrap SKUs with no model forecasts)
     v.n_models_comparable,
     round(v.divergence_ratio, 2) as model_divergence_ratio,
@@ -151,3 +178,5 @@ left join {{ ref('int_sku_description') }} d
     on d.sku = t.sku
 left join divergence v
     on v.sku = t.sku
+left join sku_context x
+    on x.sku = t.sku
