@@ -50,6 +50,17 @@ ranked as (
 sku_winsor_cap as (
     select
         sku,
+        -- the raw p75 reference, exposed so the OUTPUT cap in
+        -- forecast_results_unioned can use its own multiple without
+        -- re-implementing this quantile logic
+        nullif(
+            approx_quantiles(
+                if(wk_rank > {{ var('winsor_ref_exclude_weeks', 2) }}
+                   and low_stock_days <= {{ var('scoring_max_low_stock_days', 3) }},
+                   net_qty_unconstrained, null),
+                100
+            )[safe_offset(75)], 0
+        ) as ref_p75,
         -- 75th PERCENTILE of the reference weeks (not max, not median):
         --  * max would make the ceiling unreachable for weeks inside the reference
         --    set (any such week is <= the max), so only weeks 1-2 could ever clip;
@@ -84,6 +95,9 @@ winsorized as (
         -- net_qty_unconstrained = winsor_cap_qty was reduced to the ceiling.
         -- NULL = no ceiling applied for this SKU (no usable reference weeks).
         round(c.cap_qty, 1) as winsor_cap_qty,
+        -- the p75 reference behind that ceiling; also consumed by the OUTPUT cap
+        -- in forecast_results_unioned (× output_cap_multiple)
+        round(c.ref_p75, 1) as winsor_ref_p75,
         -- cap once a post-launch peak exists (SKU older than launch_weeks);
         -- for younger SKUs cap_qty is null → pass through unchanged
         case

@@ -31,11 +31,10 @@ VALOR_WEEKLY_FORECASTING/
 │       ├── fct_weekly_sku_sales.sql         ← shared MODEL INPUT: Mon-start ISO weekly sums,
 │       │                                      complete weeks only, eligibility flags
 │       ├── forecast_timesfm.sql             ← AI.FORECAST TimesFM 2.0 (weekly net_qty_unconstrained)
-│       ├── forecast_arima.sql               ← ARIMA_PLUS, weekly; CREATE MODEL via pre_hook;
-│       │                                      per-SKU cap curbs runaway trend/drift
-
+│       ├── forecast_arima.sql               ← ARIMA_PLUS, weekly; CREATE MODEL via pre_hook
 │       ├── forecast_naive_baseline.sql      ← last-4-complete-weeks average; mandatory benchmark floor
-│       ├── forecast_results_unioned.sql     ← view; + kalman source when var include_kalman=true
+│       ├── forecast_results_unioned.sql     ← view; + kalman source when include_kalman=true;
+│       │                                      applies the CENTRAL per-SKU output cap to all models
 │       ├── forecast_evaluation_weeks.sql    ← sku × week × model holdout detail, is_extreme_week flag,
 │       │                                      low-stock weeks excluded
 │       ├── forecast_evaluation.sql          ← per sku × model: n_extreme_weeks (PRIMARY),
@@ -96,7 +95,7 @@ stg_valor_shopify__order_line_item ──┬──> int_sku_description <── 
 - **`int_sku_description` is display-only**: latest `product_title`+`variant` per SKU, uniform across history. Joined onto outputs for chart labels; never fed to models.
 - **Two launch-related windows, deliberately different lengths — they do different jobs:**
   - `launch_weeks` (12) = **no OOS fill-in** for a SKU's first 12 weeks. Out-of-stock days in that period keep their raw value instead of being estimated, because early-life demand is too noisy to reconstruct.
-  - `winsor_ref_exclude_weeks` (2) = the first 2 complete weeks don't count when **calculating** the ceiling (they're the channel-fill weeks, so letting them set the ceiling would defeat the purpose). They are still **subject to** the ceiling — see the next bullet. Kept at 2, not 12, so that SKUs younger than 12 weeks still get a ceiling at all.
+  - `winsor_ref_exclude_weeks` (2) = the first 2 complete weeks don't count when **calculating** the p75 reference (they're the channel-fill weeks, so letting them set the ceiling would defeat the purpose). They are still **subject to** the ceiling — see the next bullet. Kept at 2, not 12, so that SKUs younger than 12 weeks still get a ceiling at all.
   - Why 2 is enough: with OOS fill-in switched off for 12 weeks, weeks 3–12 hold real sales figures. Previously the fill-in could copy a launch spike forward into weeks 3–8, inflating those weeks and therefore the ceiling too — that's no longer possible, so the ceiling can be calculated from week 3 onward safely.
 - **Imputation stays DAILY, modeling is WEEKLY**: `fct_daily_sku_sales` fills a low-stock (censored) day with the **trailing average daily rate over NON-low-stock days** — all days in the window, *not* same-weekday (same-weekday averaging used only ~4 samples, so one spiky weekday skewed it; all-days gives 28/56 samples). The value is `greatest(28-day rate, 56-day rate, net_qty_raw)`: taking the max means a declining 28-day window can't under-impute below the longer view, and the result is always **floored at raw** — true demand on a censored day is at least what sold. (Both windows are coalesced to 0 first, since BigQuery `GREATEST` returns NULL if any argument is NULL — so an all-censored window falls back to raw.) **No imputation during the launch window** (`launch_weeks`): those weeks stay raw — launch demand is too noisy to reconstruct, and imputing there echoes the launch spike into later weeks. Stored as `net_qty_unconstrained`; `fct_weekly_sku_sales` sums both columns into Mon-start ISO weeks. **All models train on the weekly `net_qty_unconstrained` sums** — the ARIMA XREG regressor is gone.
 - **Complete weeks only**: the in-progress trailing week and any partial launch week are dropped so every row is a uniform 7-day total. Weekly series stay gap-free (required by AI.FORECAST frequency inference).
@@ -113,6 +112,8 @@ stg_valor_shopify__order_line_item ──┬──> int_sku_description <── 
   |---|---|
   | ≤ 2 | pass-through (no reference week yet) |
   | ≥ 3 | reduce any week above `input_winsor_multiple` × p75(weeks 3+) down to that ceiling |
+
+- **Central output cap** (`forecast_results_unioned`): every model's `forecast_value` is capped at `output_cap_multiple` (3) × the SKU's p75 reference week — the same reference the input ceiling uses. It lives in the union **view**, not inside each model, so (a) no model can be the exception (Kalman runs in a separate Cloud Run job and previously had no cap, letting its trend extrapolate past the ceiling straight into the base-demand number), (b) everything downstream — evaluation, winner selection, `forecasting_total`, `forecast_display` — inherits it, and (c) because it's a view, changing the multiple re-caps everything at read time with no model re-runs. `lower_bound`/`upper_bound` are deliberately left uncapped: they carry each model's genuine uncertainty, which the coverage and interval-width diagnostics depend on.
 
   Historical note on why an over-long exclusion was low-risk anyway: a SKU under ~20 weeks has no winner row, so `forecasting_total` takes its number from `fallback_model` (TimesFM) or bootstrap — **ARIMA/Kalman output is never consumed for young SKUs** — and by the time a SKU *is* evaluated (~20 wks) it's past `launch_weeks` and already capped. The gap only affected (a) charts for young SKUs and (b) TimesFM's training input having no ceiling, and TimesFM doesn't extrapolate trend like ARIMA, so it's the least spike-sensitive of the three.
 
@@ -134,7 +135,7 @@ stg_valor_shopify__order_line_item ──┬──> int_sku_description <── 
 | `model_divergence_high` | 0.75 | above this = "models disagree" |
 | `launch_weeks` | 12 | no-imputation window: `fct_daily` leaves low-stock days as raw for the SKU's first 12 weeks |
 | `winsor_ref_exclude_weeks` | 2 | initial complete weeks excluded when finding the peak that anchors the winsor ceiling (`fct_weekly`) and the ARIMA cap — short so young SKUs still get a ceiling |
-| `arima_cap_multiple` | 3 | ARIMA weekly forecast capped at this × the **75th percentile** of the reference weeks (same basis as the input winsor) — curbs runaway drift |
+| `output_cap_multiple` | 3 | **central** output cap in `forecast_results_unioned`: every model's `forecast_value` capped at this × the SKU's p75 reference week. Applied in a view, so changing it re-caps without re-running models. Bounds deliberately uncapped |
 | `input_winsor_multiple` | 3 | `fct_weekly_sku_sales`: `net_qty_unconstrained` capped at this × the **75th percentile** of the reference weeks (trims launch + mid-life spikes; `net_qty_raw` untouched; SKUs with no usable reference pass through) |
 | `forecast_activity_window_weeks` | 9 |`is_active`, can be discontinued so get no forecasts|
 | `min_scored_weeks` | 6 | winner selection: min scored holdout weeks (allows up to 4 excluded weeks), each scored weeks should have no more than `scoring_max_low_stock_days`  |

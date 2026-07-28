@@ -29,50 +29,12 @@
     """
 ) }}
 
--- Per-SKU cap: ARIMA_PLUS's trend/drift component can linearly extrapolate a
--- short upswing into an absurd forecast (e.g. a SKU that peaked at 9/wk projected
--- to 57/wk). Clip each weekly value to arima_cap_multiple × the SKU's historical
--- peak week — generous enough to allow real growth, tight enough to kill runaway
--- drift. Floored at 0 (negative weekly demand is nonsensical).
-with sku_weeks as (
-    select
-        sku,
-        net_qty_unconstrained,
-        low_stock_days,
-        row_number() over (partition by sku order by week_start) as wk_rank
-    from {{ ref('fct_weekly_sku_sales') }}
-),
+-- Output capping is NOT done here — it happens centrally for ALL models in
+-- forecast_results_unioned (output_cap_multiple × the SKU's p75 reference).
+-- Keeping a second, ARIMA-only cap here would duplicate that logic and drift
+-- out of sync with it. Negative values are floored at 0 below.
+with raw_forecast as (
 
-sku_cap as (
-    -- cap basis = 75th PERCENTILE of the weeks after winsor_ref_exclude_weeks (2),
-    -- matching the input winsorization in fct_weekly_sku_sales. Not max (3× max is
-    -- effectively no cap) and not median (median proved size-biased: it removed
-    -- ~19% of real units from the smallest SKUs vs ~2% from the largest). A weekly
-    -- forecast above 3× p75 is implausible as *normal* demand.
-    -- Heavily censored weeks (low_stock_days > scoring_max_low_stock_days) are
-    -- excluded — they read near zero and would over-tighten the cap.
-    -- Fallback to the all-weeks p75 for SKUs with no usable reference weeks.
-    -- nullif(...,0) on BOTH: a very sparse SKU can have p75 = 0, and cap = 0 would
-    -- clip the entire forecast to zero. Treat 0 as "no usable reference" ->
-    -- cap_qty null -> no clipping (see the ifnull in the final select).
-    select
-        sku,
-        coalesce(
-            nullif(
-                approx_quantiles(
-                    if(wk_rank > {{ var('winsor_ref_exclude_weeks', 2) }}
-                       and low_stock_days <= {{ var('scoring_max_low_stock_days', 3) }},
-                       net_qty_unconstrained, null),
-                    100
-                )[safe_offset(75)], 0
-            ),
-            nullif(approx_quantiles(net_qty_unconstrained, 100)[safe_offset(75)], 0)
-        ) * {{ var('arima_cap_multiple', 3) }} as cap_qty
-    from sku_weeks
-    group by 1
-),
-
-raw_forecast as (
     select
         sku,
         date(forecast_timestamp) as forecast_week_start,
@@ -89,14 +51,11 @@ select
     'arima_plus' as model_name,
     r.sku,
     r.forecast_week_start,
-    -- ifnull(cap, value): least(x, NULL) is NULL in BigQuery, so a null cap
-    -- (no usable median reference) must mean "no clipping", not "null forecast".
-    greatest(least(r.forecast_value, ifnull(c.cap_qty, r.forecast_value)), 0) as forecast_value,
-    greatest(least(r.lower_bound,   ifnull(c.cap_qty, r.lower_bound)),   0) as lower_bound,
-    greatest(least(r.upper_bound,   ifnull(c.cap_qty, r.upper_bound)),   0) as upper_bound,
+    greatest(r.forecast_value, 0) as forecast_value,
+    greatest(r.lower_bound,   0) as lower_bound,
+    greatest(r.upper_bound,   0) as upper_bound,
     0.9 as confidence_level,
     current_date() as forecast_run_date,
     (select date_sub(max(week_start), interval {{ var('forecast_holdout_weeks', 0) }} week)
      from {{ ref('fct_weekly_sku_sales') }}) as train_end_week
 from raw_forecast r
-left join sku_cap c on c.sku = r.sku
