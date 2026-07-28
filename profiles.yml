@@ -1,0 +1,22 @@
+valor_forecasting:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth  # For local dev; switch to 'service-account' for Cloud Run
+      project: valor-sales
+      dataset: valor_weekly_forecasting
+      threads: 4
+      timeout_seconds: 300
+      location: northamerica-northeast2
+
+    # Cloud Run production target — ADC = the service account attached to the
+    # job, so no impersonation needed. Same dataset as dev.
+    prod:
+      type: bigquery
+      method: oauth
+      project: valor-sales
+      dataset: valor_weekly_forecasting
+      threads: 4
+      timeout_seconds: 300
+      location: northamerica-northeast2

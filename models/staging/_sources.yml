@@ -1,0 +1,43 @@
+version: 2
+
+sources:
+  - name: valor_shopify
+    database: valor-sales
+    schema: valor_shopify_line_item
+    tables:
+      - name: order_line_item
+        description: Shopify order line items for Valor (raw, shared with valor_margin_dbt)
+
+  - name: valor_inventory
+    database: valor-sales
+    schema: valor_inventory_logs
+    tables:
+      - name: daily_sku_stock_metrics
+        description: >
+          Maintained daily snapshot written by the daily_stock_log Cloud Run job
+          (cloud_run/daily_stock_log): per sku per day inventory_qty,
+          avg_daily_sales_14d (raw order_line_item, forecasting filters),
+          stock_in_days. ALL SKUs, no low-stock filter — thresholds are applied
+          in stg_low_stock_list. TODO: backfill history (separate files) for
+          dates before the job went live.
+
+  - name: forecasting_external
+    database: valor-sales
+    schema: valor_weekly_forecasting   # must match the dataset the Kalman job writes to (deploy.sh BQ_DATASET)
+    tables:
+      - name: forecast_kalman
+        description: >
+          Written by the Kalman Cloud Run Job (cloud_run/kalman_forecast),
+          standardized forecast schema, appended vintages on forecast_run_date.
+          Referenced by forecast_results_unioned when var include_kalman = true.
+
+  - name: valor_margin
+    database: valor-sales
+    schema: valor_margin_dbt
+    tables:
+      - name: int_product_category
+        description: >
+          Built by the valor_margin_dbt project (view).
+          Provides Brand and category_formatted per SKU.
+          Dependency: valor_margin_dbt must stay deployed; if it renames
+          this model, update this source.

@@ -1,0 +1,5 @@
+google-cloud-bigquery[pandas]>=3.25
+google-cloud-secret-manager>=2.20
+pandas>=2.0
+requests>=2.31
+db-dtypes>=1.2

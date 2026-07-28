@@ -1,0 +1,80 @@
+version: 2
+
+models:
+  - name: fct_daily_sku_sales
+    description: >
+      Daily imputation layer. Gap-free daily spine per SKU within product scope
+      (forecasting_product_regex var). net_qty_unconstrained = low-stock-imputed
+      (trailing 4-week same-weekday avg). Models do NOT read this directly —
+      it feeds fct_weekly_sku_sales.
+    columns:
+      - name: sku
+        tests: [not_null]
+      - name: sales_date
+        tests: [not_null]
+      - name: net_qty_raw
+      - name: net_qty_unconstrained
+      - name: is_low_stock
+
+  - name: fct_weekly_sku_sales
+    description: >
+      Shared MODEL INPUT. Mon-start ISO weekly sums of the daily layer; only
+      complete 7-day weeks kept (in-progress trailing week and partial launch
+      week dropped). net_qty_unconstrained (weekly sum of imputed daily) trains
+      all models. low_stock_days = count of censored days in the week.
+    columns:
+      - name: sku
+        tests: [not_null]
+      - name: week_start
+        tests: [not_null]
+      - name: net_qty_raw
+      - name: net_qty_unconstrained
+      - name: low_stock_days
+      - name: has_min_history
+      - name: is_active
+
+  - name: forecast_timesfm
+  - name: forecast_arima
+  - name: forecast_naive_baseline
+  - name: forecast_results_unioned
+  - name: forecast_evaluation_weeks
+    description: >
+      sku × week × model holdout scoring detail (latest vintage). Scored against
+      UNCONSTRAINED weekly actuals; majority-imputed weeks
+      (low_stock_days > scoring_max_low_stock_days) excluded to avoid grading
+      naive against its own formula. is_extreme_week = abs pct err >
+      extreme_ape_threshold (or predicted >= extreme_zero_week_units when actual = 0).
+  - name: forecast_evaluation
+    description: >
+      Per model × sku aggregates. PRIMARY: n_extreme_weeks (count of big weekly
+      misses). Secondary: total_abs_pct_err (order-window total), weekly wape.
+  - name: forecast_model_winner
+    description: >
+      Per-SKU winner by fewest extreme weeks (naive_4wk_avg floor); tiebreak
+      8-week total error, then wape. sales_category = volume quartile of
+      total_actual across eligible SKUs (first_quarter_selling_sku = top 25%).
+    columns:
+      - name: sku
+        tests: [not_null, unique]
+      - name: sales_category
+        tests:
+          - accepted_values:
+              values: ['1 - first_quarter_selling_sku', '2 - second_quarter_selling_sku', '3 - third_quarter_selling_sku', '4 - fourth_quarter_selling_sku']
+  - name: forecasting_total
+    description: >
+      BASE demand table (NOT a PO quantity — promos/one-offs are added on top by
+      the buyer): per SKU, the order_horizon_weeks total in units and
+      cartons. Model precedence: evaluated winner > fallback_model (timesfm_2_0,
+      is_fallback_model=true, for SKUs never evaluated) > bootstrap_weekly_avg
+      (run-rate, for SKUs too young for any model). model_divergence flags how
+      much the candidate models disagree on the total ((max-min)/mean of their
+      order-window totals) — a holdout-0 confidence signal; "high" = review.
+    columns:
+      - name: sku
+        tests: [not_null, unique]
+  - name: forecast_display
+    description: >
+      One-table BI source (view), weekly grain. Actuals cross-joined to the model
+      list + latest-vintage forecasts, so filtering model_name in Tableau shows
+      that model's actual-vs-forecast comparison with bounds.
+      Grain: model_name × sku × week_start (ds).

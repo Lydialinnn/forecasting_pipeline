@@ -1,0 +1,78 @@
+name: 'valor_weekly_forecasting'
+version: '1.0.0'
+
+profile: 'valor_forecasting'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+vars:
+  # weekly forecasting (Mon-start ISO weeks; only complete weeks used)
+  forecast_holdout_weeks: 10         # evaluation mode; set 0 for production runs
+  order_horizon_weeks: 10            # base-demand window = forecast horizon = evaluation window length
+  forecast_min_history_weeks: 4     # forecasting eligibility; 4-15wk SKUs get naive (fallback_model) totals until evaluable
+  forecast_activity_window_weeks: 9 # eligibility (~60 days)
+  min_scored_weeks: 6               # winner selection: min holdout weeks scored per sku×model (holdout is 10; allows up to 4 excluded weeks)
+  fallback_model: timesfm_2_0       # used by forecasting_total for SKUs with no winner row yet (too young to evaluate)
+  model_divergence_low: 0.25        # forecasting_total: (max-min)/mean of the models' order-window totals <= this = "models agree"
+  model_divergence_high: 0.75       # above this = "models disagree — review"
+  launch_weeks: 12                   # no-imputation window: fct_daily leaves low-stock days as raw for the SKU's first 12 weeks (OOS reconstruction is unreliable that early, and imputing there echoes the launch spike forward)
+  winsor_ref_exclude_weeks: 2        # initial complete weeks excluded when finding the peak that anchors the winsor ceiling + ARIMA cap. Short (2, not launch_weeks) so YOUNG SKUs still get a ceiling; safe because imputation is off during launch, so weeks 3+ are genuine raw values, not echoes.
+                                     # NOTE on why this gap was low-risk anyway: a SKU under ~20 weeks has no winner row, so forecasting_total takes its number from fallback_model (TimesFM) or bootstrap — ARIMA/Kalman output is never consumed for young SKUs; and by the time a SKU IS evaluated (~20 wks) it is past launch_weeks and already capped. The gap only affected (a) charts for young SKUs and (b) TimesFM's training input being unclipped — and TimesFM doesn't extrapolate trend like ARIMA, so it's the least spike-sensitive of the three.
+  arima_cap_multiple: 3             # ARIMA weekly forecast clipped to this × the 75th PERCENTILE of the reference weeks (same basis as input_winsor_multiple): a forecast above 3× p75 is implausible as NORMAL demand, whereas 3× max is effectively no cap
+  input_winsor_multiple: 3          # fct_weekly_sku_sales: net_qty_unconstrained clipped to this × the 75th PERCENTILE of the reference weeks (heavily censored weeks excluded — see scoring_max_low_stock_days). Not max (unreachable for weeks inside the reference set) and not median (tested size-biased: removed ~19% of units from the smallest SKUs vs ~2% from the largest, and left ~24% of SKUs uncapped). p75 removes a near-flat ~2-5% across sizes. Trims launch AND mid-life spikes toward typical demand; net_qty_raw untouched; SKUs with no usable reference pass through
+  extreme_ape_threshold: 0.5        # a week is an "extreme miss" if abs pct err > 50%
+  extreme_zero_week_units: 5        # extreme floor when actual = 0 (pct err undefined)
+  scoring_max_low_stock_days: 3     # scoring vs unconstrained actuals; weeks with MORE
+                                    # low-stock days than this (majority imputed) excluded
+
+
+  include_kalman: true             # forecast_kalman populated by the valor-kalman-forecast Cloud Run job
+
+  # product scope: EXACT whitelist of int_sku_description.brand_category_key values
+  # (case-insensitive equality, no substring matching). List available values with:
+  #   select distinct brand_category_key from valor_weekly_forecasting.int_sku_description order by 1;
+  forecasting_brand_category_list:
+    - "STLTH TITAN MAX_STLTH DISPOSABLES"
+    - "STLTH TITAN PRO_STLTH DISPOSABLES"
+    - "STLTH X GEEK BAR_STLTH DISPOSABLES"
+    - "STLTH LOOP MAX_PODS"
+    - "STLTH 8K PRO_STLTH DISPOSABLES"
+    - "STLTH LOOP 25K_PODS"
+    - "STLTH ECO_STLTH DISPOSABLES"
+    - "STLTH 5K_STLTH DISPOSABLES"
+    - "STLTH 60K_STLTH DISPOSABLES"
+    - "STLTH ECO BOX_STLTH DISPOSABLES"
+    - "STLTH ECO XL_STLTH DISPOSABLES"
+    - "STLTH ECO MINI_STLTH DISPOSABLES"
+    - "STLTH OPEN_STLTH Devices"
+    - "STLTH SNAP_PODS"
+    - "STLTH 1K_STLTH DISPOSABLES"
+    - "STLTH X GEEK BAR CANADA LIMITED EDITION_STLTH DISPOSABLES"
+    - "STLTH LOOP MAX X ELFBAR_PODS"
+    - "STLTH TITAN MAX RELOADED_STLTH DISPOSABLES"
+    - "STLTH 3K_STLTH DISPOSABLES"
+    - "STLTH NEXA_STLTH Devices"
+    - "STLTH LOOP 3_STLTH Devices"
+    - "5K_STLTH DISPOSABLES"
+    - "STLTH SWITCH_PODS"
+    - "STLTH LOOP OPEN_STLTH Devices"
+    - "STLTH LOOP MAX_STLTH Devices"
+    - "STLTH LOOP MAX OPEN_REPLACEMENT COILS"
+    - "STLTH LOOP MAX X VICE_PODS"
+
+
+
+models:
+  valor_weekly_forecasting:
+    +persist_docs:
+      relation: true
+      columns: true
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: table

@@ -1,0 +1,16 @@
+version: 2
+
+models:
+  - name: int_sku_description
+    description: >
+      One row per SKU; display/label table, never a forecast series ID.
+      Labels from the SKU's latest order record (order_date desc, last_updated_at desc).
+    columns:
+      - name: sku
+        tests: [not_null, unique]
+      - name: sku_description
+        description: UPPER(product_title) + '_' + UPPER(sku_variant_title) from the latest record
+      - name: _extracted_unit_conversion
+        description: Units per carton parsed from product_title "(N PCS/C)", defaults to 1
+      - name: brand_category_key
+        description: UPPER(brand base) + '_' + category_formatted, 'unknown' when unmapped
