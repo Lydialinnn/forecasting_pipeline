@@ -94,16 +94,15 @@ unioned_totals as (
 -- Both help a buyer judge how much to trust the base-demand number.
 sku_context as (
 
+    -- Sourced from the DAILY table, not the weekly one: fct_weekly_sku_sales only
+    -- holds COMPLETE Mon-Sun weeks, so a brand-new SKU (history shorter than one
+    -- full week) has no rows there — and those are precisely the bootstrap-tier
+    -- SKUs, which would then show NULL for every column here.
     select
-        w.sku,
-        min(d.first_sale_date) as first_sale_date,
-        sum(w.low_stock_days) as n_oos_days_total
-    from {{ ref('fct_weekly_sku_sales') }} w
-    join (
-        select sku, min(sales_date) as first_sale_date
-        from {{ ref('fct_daily_sku_sales') }}
-        group by 1
-    ) d using (sku)
+        sku,
+        min(sales_date) as first_sale_date,
+        countif(is_low_stock) as n_oos_days_total
+    from {{ ref('fct_daily_sku_sales') }}
     group by 1
 
 ),
@@ -138,10 +137,14 @@ divergence as (
         safe_divide(max(model_total) - min(model_total), nullif(avg(model_total), 0)) as divergence_ratio
     from all_model_window_totals
     group by 1
-)
+),
+
+final_rows as (
 
 select
-    t.sku,
+    -- business-facing SKU: the "-LK" suffix is stripped for the output
+    regexp_replace(t.sku, r'-LK$', '') as sku,
+    t.sku as sku_raw,
     d.sku_description,
     d.brand_category_key,
     t.selected_model,
@@ -180,3 +183,50 @@ left join divergence v
     on v.sku = t.sku
 left join sku_context x
     on x.sku = t.sku
+
+),
+
+-- Stripping "-LK" can collapse a base SKU and its -LK variant onto the same
+-- business SKU. Today that never happens, but if it ever does we merge them into
+-- ONE row rather than emitting duplicates (which would fail the unique(sku) test
+-- and break the scheduled build). Quantities are summed; descriptive/diagnostic
+-- columns are taken from the LARGEST-quantity row so the attributes stay
+-- internally consistent instead of being mixed across two different SKUs.
+ranked_rows as (
+    select
+        *,
+        row_number() over (partition by sku order by forecast_total_qty desc, sku_raw) as rn,
+        count(*) over (partition by sku) as n_merged_skus
+    from final_rows
+)
+
+select
+    sku,
+    string_agg(sku_raw, ' + ' order by sku_raw) as sku_raw,
+    n_merged_skus,
+
+    -- additive
+    round(sum(forecast_total_qty), 1) as forecast_total_qty,
+    round(sum(forecast_total_unit), 1) as forecast_total_unit,
+
+    -- attributes from the largest-quantity row
+    max(if(rn = 1, sku_description, null)) as sku_description,
+    max(if(rn = 1, brand_category_key, null)) as brand_category_key,
+    max(if(rn = 1, selected_model, null)) as selected_model,
+    logical_or(is_fallback_model) as is_fallback_model,   -- true if ANY merged row is a fallback
+    max(if(rn = 1, forecast_run_date, null)) as forecast_run_date,
+    max(if(rn = 1, window_start_week, null)) as window_start_week,
+    max(if(rn = 1, window_end_week, null)) as window_end_week,
+    max(if(rn = 1, n_forecast_weeks, null)) as n_forecast_weeks,
+    max(if(rn = 1, _extracted_unit_conversion, null)) as _extracted_unit_conversion,
+
+    min(first_sale_date) as first_sale_date,             -- earliest of the merged SKUs
+    max(sku_age_weeks) as sku_age_weeks,                 -- matches that earliest date
+    max(n_oos_days_total) as n_oos_days_total,           -- worst case, not a sum
+
+    max(if(rn = 1, n_models_comparable, null)) as n_models_comparable,
+    max(if(rn = 1, model_divergence_ratio, null)) as model_divergence_ratio,
+    max(if(rn = 1, model_divergence, null)) as model_divergence
+
+from ranked_rows
+group by sku, n_merged_skus
